@@ -295,7 +295,7 @@ class SiteReachabilityResponse(BaseModel):
     reachable: list[ReachablePage] = Field(
         ...,
         description="从首页可达的站内 HTML 页面（含首页），按广度优先首次"
-        "到达顺序（同层按 URL 排序）",
+        "到达顺序（同层按终点 URL 排序）",
     )
     unreachable: list[UnreachablePage] = Field(
         ...,

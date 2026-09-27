@@ -592,6 +592,34 @@ def test_diamond_predecessor_takes_shortest_path():
     assert by["<urn:z>"]["previous_url"] == "http://a/x"
 
 
+def test_layer_sorted_by_terminal_url_not_entry_url():
+    # 首页同时链接 /a 与 /b；/a 301 到 /z，/b 与 /z 都链接 /target。
+    # 同层先解析重定向再按终点 URL 排序：/b 排在 /z 前展开，
+    # 因此 /target 的前驱是 /b 而不是 /z（重定向不计点击）。
+    root = b'<a href="/a">a</a><a href="/b">b</a>'
+    pages = [
+        ("<urn:a>", "http://a/a", b"",
+         {"date": D, "status_code": 301, "reason": "Moved",
+          "content_type": None, "location": "/z"}),
+        ("<urn:z>", "http://a/z", b'<a href="/target">t</a>'),
+        ("<urn:b>", "http://a/b", b'<a href="/target">t</a>'),
+        ("<urn:target>", "http://a/target", b""),
+    ]
+    r = sr(site_warc(pages, root_html=root), "http://a/", AT)
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert [p["record_id"] for p in d["reachable"]] == [
+        "<urn:root>", "<urn:b>", "<urn:z>", "<urn:target>"]
+    by = reached_map(d)
+    assert by["<urn:b>"]["min_clicks"] == 1
+    assert by["<urn:b>"]["previous_url"] == "http://a/"
+    assert by["<urn:z>"]["min_clicks"] == 1
+    assert by["<urn:z>"]["previous_url"] == "http://a/"
+    assert by["<urn:target>"]["min_clicks"] == 2
+    assert by["<urn:target>"]["previous_url"] == "http://a/b"
+    assert d["unreachable"] == []
+
+
 # ---------- 根页面 / 归档错误 ----------
 
 

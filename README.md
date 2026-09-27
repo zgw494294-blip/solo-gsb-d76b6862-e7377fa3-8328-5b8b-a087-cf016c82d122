@@ -13,10 +13,10 @@
 - `POST /v1/page-assets`：接收 WARC、起始 URL 与时点，还原最终页面后逐项检查
   其静态资源（img/script/样式表）在该时点能否从同包归档还原；
 - `POST /v1/site-reachability`：接收 WARC、**首页 URL** 与时点，从首页终点起
-  按链接做**按 URL 排序的广度优先遍历**（去重防环），计算站内**同源**、终点
-  **2xx** 且 `Content-Type` 为 `text/html` 的页面可达性——返回每个可达页面的
-  记录 ID、**最短点击次数**与前驱 URL，以及该时点归档中存在但不可达的页面
-  记录 ID；
+  按链接做**逐层广度优先遍历**（每层按**终点 URL** 去重排序后扩展，防环），
+  计算站内**同源**、终点 **2xx** 且 `Content-Type` 为 `text/html` 的页面
+  可达性——返回每个可达页面的记录 ID、**最短点击次数**与前驱 URL，以及该时点
+  归档中存在但不可达的页面记录 ID；
 - `POST /v1/digest-audit`：逐条核验 response/revisit 记录的
   `WARC-Block-Digest` 与 `WARC-Payload-Digest`（sha1/sha256 的无填充
   Base32 摘要），报告每项 absent / match / mismatch 与失配总数；
@@ -489,9 +489,14 @@ curl -s http://localhost:8000/v1/page-assets \
   （base 自身可相对本页解析，规则同 `/v1/page-assets`；无有效 base 用本页
   URL），**去片段**；跨源与非 HTTP(S) 链接（`mailto:`、`javascript:` 等）
   一律忽略；
-- **按 URL 排序做广度优先遍历**：每个页面的出链按绝对 URL 字典序入队，已入队
-  /已处理的链接与重定向途经 URL 全部去重，天然防环；每个节点记录**首次到达**
-  （BFS 即最短点击次数），前驱为上一层页面的终点 URL；首页为 **0 跳、无前驱**；
+- **逐层广度优先遍历**：每层先按查询时点解析本层全部页面的出链及其重定向，
+  再按同源、2xx、`text/html` 页面的**终点 URL** 去重并排序，然后按此顺序
+  扩展下一层；同层等长路径取此顺序下**先展开的父页面**为前驱——例如首页同时
+  链接 `/a`、`/b`，`/a` 重定向到 `/z` 且 `/b`、`/z` 都链接 `/target` 时，
+  第一层按终点 URL 排序为 `/b`、`/z`，`/b` 先展开，`/target` 的
+  `min_clicks` 为 2、`previous_url` 为 `/b`；已到达的终点 URL 去重防环，
+  每个节点记录**首次到达**（BFS 即最短点击次数，重定向不计点击）；首页为
+  **0 跳、无前驱**；
 - **子链接失败一律跳过**（不使请求失败）：时点前无抓取、重定向异常
   （缺 Location / 目标非法 / 成环 / 超跳数）、终点非 2xx、非 `text/html`、
   跨源，都不产生节点也不继续展开；
@@ -512,7 +517,7 @@ curl -s http://localhost:8000/v1/page-assets \
 
 | 字段                          | 含义 |
 |-------------------------------|------|
-| `reachable`                   | 可达页面（**含首页**），按广度优先首次到达顺序排列（同层按 URL 排序） |
+| `reachable`                   | 可达页面（**含首页**），按广度优先首次到达顺序排列（同层按**终点 URL** 排序） |
 | `reachable[].record_id`       | 页面**终点记录**的 `WARC-Record-ID` 原始值（revisit 为该 revisit 自身 ID） |
 | `reachable[].min_clicks`      | 从首页到该页面的**最短点击次数**；首页为 `0`（重定向不计点击） |
 | `reachable[].previous_url`    | 最短路径上**前驱页面**的终点 URL；首页为 `null` |
@@ -1238,7 +1243,7 @@ app/
   navigate.py      # /v1/navigate：时点选取、相对 Location 跟随、成环/跳数判定
   snapshot_diff.py # /v1/snapshot-diff：双归档时点快照与四类 URL 对比
   page_assets.py   # /v1/page-assets：HTML 静态资源提取与逐项可还原性检查
-  site_reachability.py # /v1/site-reachability：a[href] 解析、按 URL 排序的 BFS 与站内页面可达性
+  site_reachability.py # /v1/site-reachability：a[href] 解析、按终点 URL 排序的逐层 BFS 与站内页面可达性
   digest_audit.py  # /v1/digest-audit：Block/Payload 摘要解析与逐条核验
   capture_index.py # /v1/capture-index：排序键分页、cursor 编解码与字节范围
   merge.py         # /v1/merge：双包原序合并、跨包冲突确定性改名与末记录补长
