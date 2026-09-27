@@ -11,8 +11,11 @@
   ``text/html``（参数忽略、大小写不敏感）；正文使用 revisit 还原后的正文；
 - 从每个页面解析 ``a[href]``：相对地址按**首个有效** ``<base href>``
   解析（规则与 /v1/page-assets 一致），去片段；跨源与非 HTTP(S) 链接忽略；
-- 按 URL 排序做广度优先遍历，已处理/已入队的链接与重定向途经 URL 均去重，
-  天然防环；每个节点取首次到达（即最短点击次数），前驱为上一层页面；
+- 分层广度优先遍历：每层先按查询时点解析该层页面的全部链接及重定向，
+  再把同源、2xx、text/html 页面的**终点 URL** 去重排序，作为下一层的
+  展开顺序；同层等长路径取此顺序下先展开的父页面为前驱。已解析的链接
+  与重定向途经 URL 均去重，天然防环；每个节点取首次到达（即最短点击
+  次数），重定向不计点击；
 - 首页（根）无抓取 → 404；根重定向错误（缺 Location、目标非法、成环、超
   跳数）→ 422；根终点非 2xx → 422 ``status_not_2xx``，非 HTML → 422
   ``not_html``；子链接的任何失败（无抓取、重定向异常、非 2xx、非 HTML、
@@ -23,7 +26,6 @@
 
 from __future__ import annotations
 
-from collections import deque
 from datetime import datetime
 from html.parser import HTMLParser
 from typing import Optional
@@ -205,43 +207,48 @@ def site_reachability(warc_b64: str, start_url: str, at: str) -> dict:
             "previous_url": None,
         }
     }
-    # 已进入遍历的链接 URL（含重定向途经的每一跳），保证不重复入队、防环。
-    seen: set[str] = {hop["url"] for hop in root_path}
+    # 已解析的链接 URL（含重定向途经的每一跳），保证不重复解析、防环。
+    used: set[str] = {hop["url"] for hop in root_path}
 
-    # BFS 队列元素：(待跟随的链接 URL, 前驱页面终点 URL, 点击次数)
-    frontier: deque[tuple[str, str, int]] = deque()
+    # 当前层的页面节点：(页面终点 URL, 终点记录, 点击次数)。同层按终点
+    # URL 排序展开；下一层由本层全部链接先解析、再按终点 URL 去重排序产生。
+    level: list[tuple[str, object, int]] = [(root_final, root_rec, 0)]
 
-    def enqueue(link_urls: list[str], parent_url: str, clicks: int) -> None:
-        for link in link_urls:
-            if link in seen:
-                continue
-            seen.add(link)
-            frontier.append((link, parent_url, clicks))
+    while level:
+        # 本层新到达的终点：终点 URL -> (前驱页面终点 URL, 终点记录, 点击
+        # 次数)。同一终点被同层多个页面链接时，先展开（终点 URL 排序靠前）
+        # 的页面成为前驱——同层等长路径取此顺序下先展开的父页面。
+        found: dict[str, tuple[str, object, int]] = {}
+        for page_url, page_rec, clicks in level:
+            for link in _page_links(page_rec.body, page_url, site_origin):
+                if link in used:
+                    continue
+                used.add(link)
+                outcome = resolve(link)
+                if outcome is None:
+                    continue  # 子链接无抓取或重定向异常：跳过
+                path, final_url, rec = outcome
+                # 重定向途经的各跳也不再作为链接重复处理（它们只导向同一终点）。
+                for hop in path:
+                    used.add(hop["url"])
+                # 终点跨源 / 非 2xx / 非 HTML 都不是页面节点，跳过。
+                if _origin(final_url) != site_origin or not _is_html_2xx(rec):
+                    continue
+                # 已在更早层到达（更短路径）或本层已被先到页面认领的终点跳过。
+                if final_url in reached or final_url in found:
+                    continue
+                found[final_url] = (page_url, rec, clicks + 1)
 
-    enqueue(_page_links(root_rec.body, root_final, site_origin),
-            root_final, 1)
-
-    while frontier:
-        link, parent_url, clicks = frontier.popleft()
-        outcome = resolve(link)
-        if outcome is None:
-            continue  # 子链接无抓取或重定向异常：跳过
-        path, final_url, rec = outcome
-        # 重定向途经的各跳也不再作为链接重复处理（它们只导向同一终点）。
-        for hop in path:
-            seen.add(hop["url"])
-        # 终点跨源 / 非 2xx / 非 HTML 都不是页面节点，跳过。
-        if _origin(final_url) != site_origin or not _is_html_2xx(rec):
-            continue
-        if final_url in reached:
-            continue
-        reached[final_url] = {
-            "record_id": rec.record_id_raw,
-            "min_clicks": clicks,
-            "previous_url": parent_url,
-        }
-        enqueue(_page_links(rec.body, final_url, site_origin),
-                final_url, clicks + 1)
+        # 本层到达的终点按终点 URL 去重排序，作为下一层的展开顺序。
+        level = []
+        for final_url in sorted(found):
+            parent_url, rec, clicks = found[final_url]
+            reached[final_url] = {
+                "record_id": rec.record_id_raw,
+                "min_clicks": clicks,
+                "previous_url": parent_url,
+            }
+            level.append((final_url, rec, clicks))
 
     # 枚举该时点下归档中其余可独立还原的同源 2xx HTML 页面：未在遍历中
     # 到达者即不可达。任何跟随失败、非同源或非 HTML 的 URL 均不计入。
